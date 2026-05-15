@@ -41,6 +41,83 @@ Build a 3-service file upload system where the browser uploads files **directly*
 6. MinIO stores it and returns `200`.
 7. Frontend → Backend (optional): "upload finished" — backend records metadata if needed.
 
+## Sequence diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant Browser as Browser<br/>(HTML + JS)
+    participant Nginx as Nginx<br/>(FE static server)
+    participant Backend as Backend<br/>(Node.js)
+    participant MinIO as MinIO<br/>(Object Storage)
+
+    Note over User,MinIO: Phase 1 — Page load (happens once)
+    User->>Browser: opens http://localhost:8080
+    Browser->>Nginx: GET / (index.html, app.js, styles.css)
+    Nginx-->>Browser: static files
+    Note right of Nginx: Nginx's job ends here.<br/>Not in upload path.
+
+    Note over User,MinIO: Phase 2 — Request a presigned URL
+    User->>Browser: picks file (e.g. report.pdf, 4.2 MB)
+    Browser->>Backend: POST /presign<br/>{ filename, contentType, size }
+    Backend->>Backend: validate request<br/>(auth? size limit? quota?)
+    Backend->>Backend: decide bucket + object key<br/>(e.g. uploads/2026/05/uuid-report.pdf)
+    Backend->>MinIO: generate presigned PUT URL<br/>(via AWS SDK, valid 15 min)
+    MinIO-->>Backend: presigned URL
+    Backend-->>Browser: { uploadUrl, objectKey, expiresAt }
+
+    Note over User,MinIO: Phase 3 — Direct upload (bytes bypass backend)
+    Browser->>MinIO: PUT {uploadUrl}<br/>body = file bytes
+    loop while bytes are streaming
+        Browser-->>Browser: XHR.upload.onprogress<br/>update progress bar
+    end
+    MinIO-->>Browser: 200 OK (ETag)
+
+    Note over User,MinIO: Phase 4 — Confirm upload (optional)
+    Browser->>Backend: POST /uploads/complete<br/>{ objectKey, etag }
+    Backend->>Backend: record metadata<br/>(if metadata store exists)
+    Backend-->>Browser: 200 OK
+    Browser-->>User: show "Upload complete ✓"
+```
+
+### Plain-text fallback
+
+```
+User    Browser     Nginx     Backend     MinIO
+ │         │          │          │          │
+ │ open    │          │          │          │
+ │────────▶│  GET /   │          │          │
+ │         │─────────▶│          │          │
+ │         │◀─────────│ HTML/JS  │          │
+ │         │  (Nginx done)       │          │
+ │ pick    │                     │          │
+ │ file    │                     │          │
+ │────────▶│  POST /presign      │          │
+ │         │────────────────────▶│          │
+ │         │                     │ generate │
+ │         │                     │─────────▶│
+ │         │                     │◀─────────│ presigned URL
+ │         │◀────────────────────│ { url }  │
+ │         │                                │
+ │         │  PUT file bytes (direct)       │
+ │         │───────────────────────────────▶│
+ │         │  ↻ progress events (local)     │
+ │         │◀───────────────────────────────│ 200 OK
+ │         │  POST /uploads/complete        │
+ │         │────────────────────▶│ record   │
+ │         │◀────────────────────│ metadata │
+ │◀────────│  "Upload complete"             │
+```
+
+### Failure paths to plan for (not drawn, but real)
+
+- **Presign request fails** (4xx/5xx from backend) → show error, no upload starts.
+- **Presigned URL expired** before user hit upload → MinIO returns `403`, frontend requests a fresh URL.
+- **Network drops mid-upload** → progress stops; offer retry. Retry restarts from byte 0 unless using multipart.
+- **Browser tab closed mid-upload** → MinIO discards the partial PUT; the object key is never created (no orphan to clean up). For multipart, orphan parts exist — needs a lifecycle rule.
+- **MinIO down** → presign succeeds (it's a signing operation, no MinIO call needed for v4 sig — but the SDK call to MinIO will fail). Backend returns 503.
+
 ## Working principles
 
 - **Design before implementation.** Agree on architecture/decisions before writing code or Dockerfiles.
@@ -67,6 +144,7 @@ _(Add each decision here with date + short rationale.)_
 
 - [x] **2026-05-15** — Project goal captured in `ai_chat.md`.
 - [x] **2026-05-15** — High-level architecture agreed (3 services, presigned-URL flow).
+- [x] **2026-05-15** — Sequence diagram drafted (Phase 1–4: load, presign, upload, confirm).
 - [ ] Decide open design questions above.
 - [ ] Scaffold `docker-compose.yml` with the three services.
 - [ ] Implement Node.js backend: `POST /presign` endpoint.
